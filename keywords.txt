@@ -1,0 +1,21 @@
+# One keyword or phrase per line. Not case-sensitive.
+# The bot alerts you if ANY of these appear in a job's title/description/tags.
+# Add or remove lines any time - no coding needed.
+
+# --- Top priority ---
+virtual assistant
+executive assistant
+personal assistant
+administrative assistant
+remote assistant
+admin support
+
+# --- Secondary (still relevant, lower priority) ---
+digital marketing
+social media manager
+social media management
+community manager
+content creator
+web3
+crypto
+customer support
