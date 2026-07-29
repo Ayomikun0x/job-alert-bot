@@ -1,17 +1,22 @@
 """
 Job Alert Telegram Bot
 ----------------------
-Checks a handful of free job sources for new postings matching your
-keywords, and sends you a Telegram message for each new match.
+Checks several free job sources for new postings matching your keywords
+(matched against the JOB TITLE only, to cut down on noise), skips
+anything matching an exclude word, and sends you a Telegram message
+for each new match - including the posting time where the source
+provides one.
 
 You should NOT need to edit this file. Everything you'd want to change
-lives in keywords.txt (your keyword list) and the two secrets
+lives in keywords.txt / excludes.txt and the two secrets
 (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) set up in GitHub Actions.
 """
 
 import os
 import json
 import time
+from datetime import datetime, timezone
+
 import requests
 import feedparser
 from bs4 import BeautifulSoup
@@ -19,6 +24,7 @@ from bs4 import BeautifulSoup
 # ---------- CONFIG ----------
 SEEN_FILE = "seen_jobs.json"
 KEYWORDS_FILE = "keywords.txt"
+EXCLUDES_FILE = "excludes.txt"
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -27,11 +33,15 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 
 # ---------- HELPERS ----------
-def load_keywords():
-    if not os.path.exists(KEYWORDS_FILE):
+def load_lines(path):
+    if not os.path.exists(path):
         return []
-    with open(KEYWORDS_FILE, "r", encoding="utf-8") as f:
-        return [line.strip().lower() for line in f if line.strip() and not line.strip().startswith("#")]
+    with open(path, "r", encoding="utf-8") as f:
+        return [
+            line.strip().lower()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
 
 
 def load_seen():
@@ -42,21 +52,60 @@ def load_seen():
 
 
 def save_seen(seen_ids):
-    trimmed = list(seen_ids)[-3000:]
+    trimmed = list(seen_ids)[-4000:]
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f)
 
 
-def matches_keywords(text, keywords):
-    text = text.lower()
-    return any(kw in text for kw in keywords)
+def title_matches(title, keywords, excludes):
+    title_lower = title.lower()
+    if any(ex in title_lower for ex in excludes):
+        return False
+    return any(kw in title_lower for kw in keywords)
 
 
-def send_telegram(title, company, link, source):
+def format_timestamp(value):
+    """Best-effort formatting of whatever date/time value a source gives us."""
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(value, tz=timezone.utc)
+            return dt.strftime("%d %b %Y, %H:%M UTC")
+        value_str = str(value).strip()
+        formats = [
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S",
+            "%a, %d %b %Y %H:%M:%S %z",
+            "%Y-%m-%d",
+        ]
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(value_str, fmt)
+                return dt.strftime("%d %b %Y, %H:%M")
+            except ValueError:
+                continue
+        return value_str
+    except Exception:
+        return None
+
+
+def send_telegram(job):
     if not BOT_TOKEN or not CHAT_ID:
         print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID - skipping send.")
         return
-    message = f"🆕 *{title}*\n🏢 {company}\n📍 Source: {source}\n🔗 {link}"
+    posted = format_timestamp(job.get("posted"))
+    posted_line = f"🕒 Posted: {posted}\n" if posted else ""
+    company_line = f"🏢 {job['company']}\n" if job.get("company") else ""
+    message = (
+        f"🆕 *{job['title']}*\n"
+        f"{company_line}"
+        f"{posted_line}"
+        f"📍 Source: {job['source']}\n"
+        f"🔗 {job['link']}"
+    )
     try:
         resp = requests.post(
             TELEGRAM_API,
@@ -90,9 +139,9 @@ def fetch_remoteok():
             jobs.append({
                 "id": f"remoteok-{item.get('id')}",
                 "title": item.get("position", "Untitled role"),
-                "company": item.get("company", "Unknown company"),
+                "company": item.get("company", ""),
                 "link": item.get("url", "https://remoteok.com"),
-                "text": f"{item.get('position','')} {item.get('company','')} {' '.join(item.get('tags', []))}",
+                "posted": item.get("date"),
                 "source": "RemoteOK",
             })
     except Exception as e:
@@ -109,9 +158,9 @@ def fetch_remotive():
             jobs.append({
                 "id": f"remotive-{item.get('id')}",
                 "title": item.get("title", "Untitled role"),
-                "company": item.get("company_name", "Unknown company"),
+                "company": item.get("company_name", ""),
                 "link": item.get("url", "https://remotive.com"),
-                "text": f"{item.get('title','')} {item.get('category','')} {item.get('description','')[:300]}",
+                "posted": item.get("publication_date"),
                 "source": "Remotive",
             })
     except Exception as e:
@@ -129,7 +178,7 @@ def fetch_wwr():
                 "title": entry.get("title", "Untitled role"),
                 "company": "",
                 "link": entry.get("link", "https://weworkremotely.com"),
-                "text": entry.get("title", "") + " " + entry.get("summary", ""),
+                "posted": entry.get("published"),
                 "source": "WeWorkRemotely",
             })
     except Exception as e:
@@ -157,7 +206,7 @@ def fetch_jobberman():
                 "title": title,
                 "company": "",
                 "link": link,
-                "text": title,
+                "posted": None,
                 "source": "Jobberman",
             })
     except Exception as e:
@@ -165,9 +214,70 @@ def fetch_jobberman():
     return jobs
 
 
+def fetch_arbeitnow():
+    jobs = []
+    try:
+        resp = requests.get("https://www.arbeitnow.com/api/job-board-api", timeout=20)
+        data = resp.json()
+        for item in data.get("data", []):
+            jobs.append({
+                "id": f"arbeitnow-{item.get('slug')}",
+                "title": item.get("title", "Untitled role"),
+                "company": item.get("company_name", ""),
+                "link": item.get("url", "https://www.arbeitnow.com"),
+                "posted": item.get("created_at"),
+                "source": "Arbeitnow",
+            })
+    except Exception as e:
+        print("Arbeitnow fetch error:", e)
+    return jobs
+
+
+def fetch_jobicy():
+    jobs = []
+    try:
+        resp = requests.get("https://jobicy.com/api/v2/remote-jobs?count=50", timeout=20)
+        data = resp.json()
+        for item in data.get("jobs", []):
+            jobs.append({
+                "id": f"jobicy-{item.get('id')}",
+                "title": item.get("jobTitle", "Untitled role"),
+                "company": item.get("companyName", ""),
+                "link": item.get("url", "https://jobicy.com"),
+                "posted": item.get("pubDate"),
+                "source": "Jobicy",
+            })
+    except Exception as e:
+        print("Jobicy fetch error:", e)
+    return jobs
+
+
+def fetch_himalayas():
+    jobs = []
+    try:
+        resp = requests.get("https://himalayas.app/jobs/api?limit=20&offset=0", timeout=20)
+        data = resp.json()
+        listings = data.get("jobs", data) if isinstance(data, dict) else data
+        for item in listings:
+            if not isinstance(item, dict):
+                continue
+            jobs.append({
+                "id": f"himalayas-{item.get('guid')}",
+                "title": item.get("title", "Untitled role"),
+                "company": item.get("companyName", ""),
+                "link": item.get("applicationLink", "https://himalayas.app"),
+                "posted": item.get("pubDate"),
+                "source": "Himalayas",
+            })
+    except Exception as e:
+        print("Himalayas fetch error:", e)
+    return jobs
+
+
 # ---------- MAIN ----------
 def main():
-    keywords = load_keywords()
+    keywords = load_lines(KEYWORDS_FILE)
+    excludes = load_lines(EXCLUDES_FILE)
     if not keywords:
         print("No keywords configured in keywords.txt - exiting.")
         return
@@ -180,6 +290,9 @@ def main():
     all_jobs += fetch_remotive()
     all_jobs += fetch_wwr()
     all_jobs += fetch_jobberman()
+    all_jobs += fetch_arbeitnow()
+    all_jobs += fetch_jobicy()
+    all_jobs += fetch_himalayas()
 
     print(f"Fetched {len(all_jobs)} total postings across all sources.")
 
@@ -187,8 +300,8 @@ def main():
     for job in all_jobs:
         if job["id"] in seen:
             continue
-        if matches_keywords(job["text"], keywords):
-            send_telegram(job["title"], job["company"], job["link"], job["source"])
+        if title_matches(job["title"], keywords, excludes):
+            send_telegram(job)
             new_matches += 1
             time.sleep(1)
         new_seen.add(job["id"])
